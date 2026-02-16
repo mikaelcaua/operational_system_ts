@@ -12,8 +12,5 @@ if (args.length < 3) {
   else if (op === "*") res = n1 * n2;
   else if (op === "/") res = n1 / n2;
 
-  console.log("🧮 Resultado da Calculadora: " + res);
-
-  sistema.criarArquivo("resultado.txt", "O ultimo resultado foi: " + res);
-  console.log("(Resultado salvo em resultado.txt)");
+  console.log("resultado: " + res);
 }

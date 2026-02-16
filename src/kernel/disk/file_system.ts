@@ -28,6 +28,19 @@ export interface DetalhesArquivo {
 
 export function useSistemaDeArquivos() {
   const tabelaFAT = new Uint32Array(QTD_ENTRADAS_FAT);
+  let discoBloqueado = false;
+
+  function processarComLock<T>(callback: () => T): T {
+    if (discoBloqueado) {
+      throw new Error("SISTEMA: Conflito de I/O. Disco ocupado.");
+    }
+    discoBloqueado = true;
+    try {
+      return callback();
+    } finally {
+      discoBloqueado = false;
+    }
+  }
 
   function abrirDisco(modoLeitura: string): number {
     const pastaDoDisco = path.dirname(CAMINHO_DO_DISCO);
@@ -94,172 +107,164 @@ export function useSistemaDeArquivos() {
   }
 
   function lerConteudoArquivo(nomeArquivo: string): string | null {
-    const arquivos = listarArquivos();
-    const arquivoEncontrado = arquivos.find((arq) => arq.nome === nomeArquivo);
-
-    if (!arquivoEncontrado) return null;
-
-    const descritor = abrirDisco("r");
-    const bufferConteudo = Buffer.alloc(arquivoEncontrado.tamanho);
-
-    let clusterAtual = arquivoEncontrado.clusterInicial;
-    let bytesLidos = 0;
-
-    while (
-      clusterAtual !== FIM_DE_ARQUIVO &&
-      bytesLidos < arquivoEncontrado.tamanho
-    ) {
-      const posicaoFisica = POSICAO_DADOS + clusterAtual * TAMANHO_CLUSTER;
-      const quantoLer = Math.min(
-        TAMANHO_CLUSTER,
-        arquivoEncontrado.tamanho - bytesLidos,
+    return processarComLock(() => {
+      const arquivos = listarArquivos();
+      const arquivoEncontrado = arquivos.find(
+        (arq) => arq.nome === nomeArquivo,
       );
 
-      fs.readSync(
-        descritor,
-        bufferConteudo,
-        bytesLidos,
-        quantoLer,
-        posicaoFisica,
-      );
+      if (!arquivoEncontrado) return null;
 
-      bytesLidos += quantoLer;
-      clusterAtual = tabelaFAT[clusterAtual];
-    }
-    fs.closeSync(descritor);
-    return bufferConteudo.toString("utf-8");
+      const descritor = abrirDisco("r");
+      const bufferConteudo = Buffer.alloc(arquivoEncontrado.tamanho);
+
+      let clusterAtual = arquivoEncontrado.clusterInicial;
+      let bytesLidos = 0;
+
+      while (
+        clusterAtual !== FIM_DE_ARQUIVO &&
+        bytesLidos < arquivoEncontrado.tamanho
+      ) {
+        const posicaoFisica = POSICAO_DADOS + clusterAtual * TAMANHO_CLUSTER;
+        const quantoLer = Math.min(
+          TAMANHO_CLUSTER,
+          arquivoEncontrado.tamanho - bytesLidos,
+        );
+
+        fs.readSync(
+          descritor,
+          bufferConteudo,
+          bytesLidos,
+          quantoLer,
+          posicaoFisica,
+        );
+        bytesLidos += quantoLer;
+        clusterAtual = tabelaFAT[clusterAtual];
+      }
+      fs.closeSync(descritor);
+      return bufferConteudo.toString("utf-8");
+    });
   }
 
   function criarArquivo(nome: string, conteudo: string): boolean {
-    const dados = Buffer.from(conteudo);
-    const clustersNecessarios = Math.ceil(dados.length / TAMANHO_CLUSTER);
+    return processarComLock(() => {
+      const dados = Buffer.from(conteudo);
+      const clustersNecessarios = Math.ceil(dados.length / TAMANHO_CLUSTER);
+      const clustersLivres: number[] = [];
 
-    const clustersLivres: number[] = [];
-    for (let i = 2; i < QTD_ENTRADAS_FAT; i++) {
-      if (tabelaFAT[i] === CLUSTER_LIVRE) {
-        clustersLivres.push(i);
-        if (clustersLivres.length === clustersNecessarios) break;
+      for (let i = 2; i < QTD_ENTRADAS_FAT; i++) {
+        if (tabelaFAT[i] === CLUSTER_LIVRE) {
+          clustersLivres.push(i);
+          if (clustersLivres.length === clustersNecessarios) break;
+        }
       }
-    }
 
-    if (clustersLivres.length < clustersNecessarios) return false;
+      if (clustersLivres.length < clustersNecessarios) return false;
 
-    const descritor = abrirDisco("r+");
-    let indiceDiretorio = -1;
-    const bufferDiretorio = Buffer.alloc(TAMANHO_REGISTRO_ARQUIVO);
+      const descritor = abrirDisco("r+");
+      let indiceDiretorio = -1;
+      const bufferDiretorio = Buffer.alloc(TAMANHO_REGISTRO_ARQUIVO);
 
-    for (let i = 0; i < MAXIMO_ARQUIVOS; i++) {
-      fs.readSync(
-        descritor,
-        bufferDiretorio,
-        0,
-        TAMANHO_REGISTRO_ARQUIVO,
-        POSICAO_DIRETORIO + i * TAMANHO_REGISTRO_ARQUIVO,
-      );
-      if (bufferDiretorio[0] === 0) {
-        indiceDiretorio = i;
-        break;
+      for (let i = 0; i < MAXIMO_ARQUIVOS; i++) {
+        fs.readSync(
+          descritor,
+          bufferDiretorio,
+          0,
+          TAMANHO_REGISTRO_ARQUIVO,
+          POSICAO_DIRETORIO + i * TAMANHO_REGISTRO_ARQUIVO,
+        );
+        if (bufferDiretorio[0] === 0) {
+          indiceDiretorio = i;
+          break;
+        }
       }
-    }
 
-    if (indiceDiretorio === -1) {
-      fs.closeSync(descritor);
-      return false;
-    }
+      if (indiceDiretorio === -1) {
+        fs.closeSync(descritor);
+        return false;
+      }
 
-    for (let i = 0; i < clustersLivres.length; i++) {
-      const clusterAtual = clustersLivres[i];
-      const proximoCluster =
-        i === clustersLivres.length - 1
-          ? FIM_DE_ARQUIVO
-          : clustersLivres[i + 1];
+      for (let i = 0; i < clustersLivres.length; i++) {
+        const clusterAtual = clustersLivres[i];
+        const proximoCluster =
+          i === clustersLivres.length - 1
+            ? FIM_DE_ARQUIVO
+            : clustersLivres[i + 1];
+        tabelaFAT[clusterAtual] = proximoCluster;
 
-      tabelaFAT[clusterAtual] = proximoCluster;
+        const inicioRecorte = i * TAMANHO_CLUSTER;
+        const pedacoDados = dados.subarray(
+          inicioRecorte,
+          Math.min(inicioRecorte + TAMANHO_CLUSTER, dados.length),
+        );
 
-      const inicioRecorte = i * TAMANHO_CLUSTER;
-      const fimRecorte = Math.min(
-        inicioRecorte + TAMANHO_CLUSTER,
-        dados.length,
-      );
-      const pedacoDados = dados.subarray(inicioRecorte, fimRecorte);
+        fs.writeSync(
+          descritor,
+          pedacoDados,
+          0,
+          pedacoDados.length,
+          POSICAO_DADOS + clusterAtual * TAMANHO_CLUSTER,
+        );
+      }
+
+      const novoRegistro = Buffer.alloc(TAMANHO_REGISTRO_ARQUIVO);
+      novoRegistro.write(nome, 0, 32, "utf-8");
+      novoRegistro.writeUInt32LE(clustersLivres[0], 32);
+      novoRegistro.writeUInt32LE(dados.length, 36);
 
       fs.writeSync(
         descritor,
-        pedacoDados,
+        novoRegistro,
         0,
-        pedacoDados.length,
-        POSICAO_DADOS + clusterAtual * TAMANHO_CLUSTER,
+        TAMANHO_REGISTRO_ARQUIVO,
+        POSICAO_DIRETORIO + indiceDiretorio * TAMANHO_REGISTRO_ARQUIVO,
       );
-    }
-
-    const novoRegistro = Buffer.alloc(TAMANHO_REGISTRO_ARQUIVO);
-    novoRegistro.write(nome, 0, 32, "utf-8");
-    novoRegistro.writeUInt32LE(clustersLivres[0], 32);
-    novoRegistro.writeUInt32LE(dados.length, 36);
-
-    fs.writeSync(
-      descritor,
-      novoRegistro,
-      0,
-      TAMANHO_REGISTRO_ARQUIVO,
-      POSICAO_DIRETORIO + indiceDiretorio * TAMANHO_REGISTRO_ARQUIVO,
-    );
-
-    fs.closeSync(descritor);
-    salvarTabelaFAT();
-    return true;
+      fs.closeSync(descritor);
+      salvarTabelaFAT();
+      return true;
+    });
   }
 
   function apagarArquivo(nome: string): boolean {
-    const descritor = abrirDisco("r+");
-    const bufferDiretorio = Buffer.alloc(TAMANHO_REGISTRO_ARQUIVO);
-    let encontrou = false;
+    return processarComLock(() => {
+      const descritor = abrirDisco("r+");
+      const bufferDiretorio = Buffer.alloc(TAMANHO_REGISTRO_ARQUIVO);
+      let encontrou = false;
 
-    for (let i = 0; i < MAXIMO_ARQUIVOS; i++) {
-      const posicaoAtual = POSICAO_DIRETORIO + i * TAMANHO_REGISTRO_ARQUIVO;
-      fs.readSync(
-        descritor,
-        bufferDiretorio,
-        0,
-        TAMANHO_REGISTRO_ARQUIVO,
-        posicaoAtual,
-      );
-      const nomeLido = bufferDiretorio
-        .toString("utf-8", 0, 32)
-        .replace(/\0/g, "");
-
-      if (nomeLido === nome) {
-        const primeiroCluster = bufferDiretorio.readUInt32LE(32);
-
-        const registroVazio = Buffer.alloc(TAMANHO_REGISTRO_ARQUIVO);
-        fs.writeSync(
+      for (let i = 0; i < MAXIMO_ARQUIVOS; i++) {
+        const posicaoAtual = POSICAO_DIRETORIO + i * TAMANHO_REGISTRO_ARQUIVO;
+        fs.readSync(
           descritor,
-          registroVazio,
+          bufferDiretorio,
           0,
           TAMANHO_REGISTRO_ARQUIVO,
           posicaoAtual,
         );
+        if (
+          bufferDiretorio.toString("utf-8", 0, 32).replace(/\0/g, "") === nome
+        ) {
+          let clusterAtual = bufferDiretorio.readUInt32LE(32);
+          fs.writeSync(
+            descritor,
+            Buffer.alloc(TAMANHO_REGISTRO_ARQUIVO),
+            0,
+            TAMANHO_REGISTRO_ARQUIVO,
+            posicaoAtual,
+          );
 
-        let clusterAtual = primeiroCluster;
-        while (clusterAtual !== FIM_DE_ARQUIVO && clusterAtual !== 0) {
-          const proximo = tabelaFAT[clusterAtual];
-          tabelaFAT[clusterAtual] = CLUSTER_LIVRE;
-          clusterAtual = proximo;
+          while (clusterAtual !== FIM_DE_ARQUIVO && clusterAtual !== 0) {
+            const proximo = tabelaFAT[clusterAtual];
+            tabelaFAT[clusterAtual] = CLUSTER_LIVRE;
+            clusterAtual = proximo;
+          }
+          encontrou = true;
+          break;
         }
-
-        encontrou = true;
-        break;
       }
-    }
-
-    fs.closeSync(descritor);
-    if (encontrou) salvarTabelaFAT();
-    return encontrou;
-  }
-
-  function formatarDisco() {
-    if (fs.existsSync(CAMINHO_DO_DISCO)) fs.unlinkSync(CAMINHO_DO_DISCO);
-    iniciar();
+      fs.closeSync(descritor);
+      if (encontrou) salvarTabelaFAT();
+      return encontrou;
+    });
   }
 
   return {
@@ -268,6 +273,5 @@ export function useSistemaDeArquivos() {
     lerConteudoArquivo,
     criarArquivo,
     apagarArquivo,
-    formatarDisco,
   };
 }
