@@ -1,10 +1,12 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
+import { Worker } from "node:worker_threads";
 import { useSistemaDeArquivos } from "../disk/file_system.js";
 
 interface Processo {
   pid: number;
   nome: string;
-  timers: any[];
+  worker: Worker;
   inicio: number;
 }
 
@@ -13,16 +15,28 @@ export function useSistemaDeProgramas(onOutput: (msg: string) => void) {
   let contadorPID = 1;
   const tabelaProcessos: Processo[] = [];
 
+  const PASTA_PROGRAMAS_REAIS = path.resolve("programs_to_install");
+
   function instalarPrograma(
-    caminhoReal: string,
+    nomeArquivoReal: string,
     nomeNoSistema: string,
   ): boolean {
-    if (!fs.existsSync(caminhoReal)) {
-      onOutput(`Erro: Arquivo local '${caminhoReal}' não existe.`);
+    const caminhoCompleto = path.join(PASTA_PROGRAMAS_REAIS, nomeArquivoReal);
+
+    if (!fs.existsSync(caminhoCompleto)) {
+      onOutput(
+        `Erro: Arquivo '${nomeArquivoReal}' não encontrado em ${PASTA_PROGRAMAS_REAIS}`,
+      );
       return false;
     }
-    const codigo = fs.readFileSync(caminhoReal, "utf-8");
-    return sistemaDeArquivos.criarArquivo(nomeNoSistema, codigo);
+
+    try {
+      const codigo = fs.readFileSync(caminhoCompleto, "utf-8");
+      return sistemaDeArquivos.criarArquivo(nomeNoSistema, codigo);
+    } catch (e: any) {
+      onOutput(`Erro ao ler arquivo: ${e.message}`);
+      return false;
+    }
   }
 
   function executarPrograma(
@@ -32,67 +46,70 @@ export function useSistemaDeProgramas(onOutput: (msg: string) => void) {
     const codigoFonte = sistemaDeArquivos.lerConteudoArquivo(nomeNoSistema);
 
     if (!codigoFonte) {
-      onOutput(`Erro: Programa '${nomeNoSistema}' não encontrado.`);
+      onOutput(
+        `Erro: Programa '${nomeNoSistema}' não encontrado no disco virtual.`,
+      );
       return;
     }
 
     const pid = contadorPID++;
+
+    const workerCode = `
+import { parentPort } from "node:worker_threads";
+
+const args = ${JSON.stringify(argumentos)};
+const console = {
+  log: (...msg) => parentPort.postMessage({ type: 'log', content: msg.join(' ') }),
+  error: (...msg) => parentPort.postMessage({ type: 'error', content: msg.join(' ') })
+};
+
+async function rodar() {
+  try {
+    ${codigoFonte}
+  } catch (e) {
+    parentPort.postMessage({ type: 'error', content: e.message });
+  }
+}
+
+rodar();
+    `;
+
+    const scriptBase64 = Buffer.from(workerCode).toString("base64");
+    const workerURL = new URL(`data:text/javascript;base64,${scriptBase64}`);
+
+    const worker = new Worker(workerURL);
+
     const novoProcesso: Processo = {
       pid,
       nome: nomeNoSistema,
-      timers: [],
+      worker,
       inicio: Date.now(),
     };
+
     tabelaProcessos.push(novoProcesso);
 
-    const consoleFalso = {
-      log: (...msg: any[]) => onOutput(`[PID ${pid}]: ${msg.join(" ")}`),
-    };
+    worker.on("message", (msg) => {
+      if (msg.type === "log") onOutput(`[PID ${pid}]: ${msg.content}`);
+      if (msg.type === "error") onOutput(`[PID ${pid} ERRO]: ${msg.content}`);
+    });
 
-    const setIntervalFalso = (funcao: Function, tempo: number) => {
-      const idTimer = setInterval(() => {
-        funcao();
-      }, tempo);
-      novoProcesso.timers.push(idTimer);
-      return idTimer;
-    };
+    worker.on("error", (err) => {
+      onOutput(`[PID ${pid} CRASH]: ${err.message}`);
+      matarProcesso(pid);
+    });
 
-    try {
-      const tempoAntes = Date.now();
-
-      const carregarExecutavel = new Function(
-        "args",
-        "sistema",
-        "console",
-        "setInterval",
-        codigoFonte,
-      );
-
-      carregarExecutavel(
-        argumentos,
-        sistemaDeArquivos,
-        consoleFalso,
-        setIntervalFalso,
-      );
-
-      const duracao = Date.now() - tempoAntes;
-      if (duracao > 1000) {
-        onOutput(
-          `[SISTEMA]: Aviso - PID ${pid} ocupou a CPU por ${duracao}ms.`,
-        );
-      }
-    } catch (e: any) {
-      onOutput(`Erro de execução (PID ${pid}): ${e.message}`);
-    }
+    worker.on("exit", () => {
+      const indice = tabelaProcessos.findIndex((p) => p.pid === pid);
+      if (indice !== -1) tabelaProcessos.splice(indice, 1);
+    });
   }
 
   function matarProcesso(pidAlvo: number) {
     const indice = tabelaProcessos.findIndex((p) => p.pid === pidAlvo);
     if (indice !== -1) {
-      const processo = tabelaProcessos[indice];
-      processo.timers.forEach((t) => clearInterval(t));
+      tabelaProcessos[indice].worker.terminate();
       tabelaProcessos.splice(indice, 1);
-      onOutput(`Processo ${processo.nome} (PID ${pidAlvo}) encerrado.`);
+      onOutput(`Processo ${pidAlvo} encerrado.`);
     } else {
       onOutput("PID não encontrado.");
     }
@@ -102,10 +119,14 @@ export function useSistemaDeProgramas(onOutput: (msg: string) => void) {
     return tabelaProcessos.map((p) => ({
       PID: p.pid,
       Nome: p.nome,
-      Timers: p.timers.length,
       Uptime: `${Math.floor((Date.now() - p.inicio) / 1000)}s`,
     }));
   }
 
-  return { instalarPrograma, executarPrograma, matarProcesso, listarProcessos };
+  return {
+    instalarPrograma,
+    executarPrograma,
+    matarProcesso,
+    listarProcessos,
+  };
 }
